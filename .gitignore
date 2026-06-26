@@ -1,0 +1,12 @@
+# Exclude dynamic output folders and spreadsheet metrics
+output/
+scripts/output/
+*.csv
+*.png
+*.pdf
+
+# Exclude local R runtime tracking environments
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
