@@ -10,3 +10,12 @@ scripts/output/
 .RData
 .Ruserdata
 .Rproj.user/
+
+# Ignore temporary JAGS files
+singleUQ.txt
+
+# Ignore local simulation data and graphics outputs
+output/
+combined_loggerhead_nests.csv
+cc_safe_rep.csv
+cc_dsll_interactions.csv

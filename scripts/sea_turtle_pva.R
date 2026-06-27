@@ -38,6 +38,11 @@ use_mock_data <- TRUE
 # Define the target species identifier code used across generated files
 target_species <- "cc"
 
+# --- GLOBAL MODEL MODE SWITCH ---
+# Set to "take" to model fishery removals (Original Gold Standard)
+# Set to "benefit" to model conservation additions (The Inverse Framework)
+model_mode <- "take"
+
 # Dynamically establish a relative output directory pathway within the current working folder
 out_dir <- paste0(getwd(), "/output")
 
@@ -133,7 +138,7 @@ sp_pf          <- 0.65     # Population sex ratio scale factor representing the 
 # Conway-Maxwell-Poisson (CMP) parameters for stochastic future take generation
 cmp_mu         <- 15.0     # Central expected value anchor for future longline fishery interaction attempts
 cmp_nu         <- 0.1      # Dispersion coefficient (values < 1 define heavy over-dispersion models)
-beach_cols     <- c("Maehama", "Inakahama", "Yotsusehama") # Names of the indexing nesting columns to track
+beach_cols     <- names(read.csv(nest_file, nrows = 1))[-1] # Automatically extracts whatever beach names are present in the dataset
 
 n_sims  <- 1000   # Total count of Monte Carlo iterations used to build error matrices
 horizon <- 100    # Number of sequential years to project forward into the future PVA timeline
@@ -229,16 +234,19 @@ safe_df <- read.csv(safe_file, stringsAsFactors = FALSE)
 # Dynamically locate the specific text column tracking the calendar census year
 year_col <- names(df_raw)[grep("year", names(df_raw), ignore.case = TRUE)[1]]
 
+# Calculate automated data timelines to replace hardcoded 1985/2015 limits
+years_vector    <- sort(unique(df_raw[[year_col]]))
+n_years_dynamic <- length(years_vector)
+
 # Filter, scale, and clean the census data matrix for JAGS engine consumption
 abund_df <- df_raw %>%
-  rename(Year = !!sym(year_col)) %>% # Relabel the dynamic year column header name to a standard label
-  filter(Year >= 1985 & Year <= 2015) %>% # Restrain dataset strictly to 31 baseline years
-  select(Year, all_of(beach_cols)) %>% # Drop extra metadata columns outside tracking beach arrays
-  group_by(Year) %>% # Collapse any duplicate row entries within shared census years
+  rename(Year = !!sym(year_col)) %>% 
+  select(Year, all_of(beach_cols)) %>% 
+  group_by(Year) %>% 
   summarise(across(all_of(beach_cols), ~sum(as.numeric(.), na.rm=TRUE)), .groups="drop") %>%
-  tidyr::pivot_longer(cols = all_of(beach_cols), names_to = "Site", values_to = "Annual_Nesters") %>% # Pivot long
-  mutate(Annual_Nesters = Annual_Nesters / sp_clutch_freq) %>% # Convert raw nest counts into active nesting females
-  mutate(Annual_Nesters = ifelse(Annual_Nesters <= 0, NA_real_, Annual_Nesters)) # Replace zero values with true structural NAs
+  tidyr::pivot_longer(cols = all_of(beach_cols), names_to = "Site", values_to = "Annual_Nesters") %>% 
+  mutate(Annual_Nesters = Annual_Nesters / sp_clutch_freq) %>% 
+  mutate(Annual_Nesters = ifelse(Annual_Nesters <= 0, NA_real_, Annual_Nesters))
 
 # Save the structured historical matrix cleanly into your relative output folder path
 write.csv(abund_df, paste0(out_dir, "/table_1_abundance_matrix.csv"), row.names = FALSE)
@@ -250,22 +258,22 @@ message("--- Running original singleUQ trend model ---")
 
 # Define execution function wrapping the JAGS interface loop
 run_trend_model <- function(df_abund, beaches) {
-  # Reconstruct structural arrays into wide dimensions for row indexing transposition
   df_wide <- df_abund %>% select(Year, Site, Annual_Nesters) %>% pivot_wider(names_from=Site, values_from=Annual_Nesters) %>% arrange(Year)
-  d_mat <- t(log(df_wide[, beaches])) # Transpose log-transformed counts into a site-by-year data matrix
+  d_mat <- t(log(df_wide[, beaches, drop = FALSE])) # Protected matrix drop
   
-  n_ts <- length(beaches) # Calculate total tracking beach columns
-  Z_m <- matrix(0, n_ts+1, n_ts) # Pre-allocate indicator routing allocation mapping array
-  for(i in 1:n_ts) Z_m[i,1] <- 1 # Route all site pathways back to single latent population tracking trend
+  n_ts <- length(beaches) 
+  Z_m <- matrix(0, n_ts+1, n_ts) 
+  for(i in 1:n_ts) Z_m[i,1] <- 1 
   
-  # Build the formal data list structure explicitly demanded by the compiled text script
   j_data <- list(
-    Y = rbind(d_mat, NA), n.yrs = 31, n.timeseries = n_ts, Z = Z_m,
+    Y = rbind(d_mat, NA), 
+    n.yrs = n_years_dynamic,      # Dynamic scale assigned here
+    n.timeseries = n_ts, 
+    Z = Z_m,
     a_mean=0, a_sd=4, u_mean=0, u_sd=0.5,
     q_alpha=0.01, q_beta=0.01, r_alpha=0.01, r_beta=0.01,
     x0_mean=mean(d_mat, na.rm=TRUE), x0_sd=10
   )
-  # Execute MCMC chains sequentially inside the native engine shell
   jagsUI::jags(
     data = j_data, inits = NULL,
     parameters.to.save = c("A", "U", "Q", "R", "X0", "X"),
@@ -273,28 +281,32 @@ run_trend_model <- function(df_abund, beaches) {
   )
 }
 
-# Run the unadjusted baseline execution track
 trend_base <- run_trend_model(abund_df, beach_cols)
 
-# Extract latent population state tracks from posterior vectors
 X_post <- trend_base$sims.list$X
-total_pop_post <- exp(X_post) # Initialize total population array scaled back from log formats
-for(j in 2:length(beach_cols)) {
-  # Add individual beach counts back into pool by scaling deviations via regional offset posteriors
-  total_pop_post = total_pop_post + exp(X_post + trend_base$sims.list$A[, j])
+total_pop_post <- exp(X_post) 
+
+# SAFE GUARD: Colon loop sequence inversion protected if dataset contains 1 single beach
+if (length(beach_cols) > 1) {
+  for(j in 2:length(beach_cols)) {
+    total_pop_post = total_pop_post + exp(X_post + trend_base$sims.list$A[, j])
+  }
 }
-total_pop_post <- total_pop_post * sp_remig_int # Scale active nesting population back into absolute adult cohort population size
-start_take_draws <- total_pop_post[, 31] # Extract all draws matching terminal baseline evaluation index (Year 2015)
+total_pop_post <- total_pop_post * sp_remig_int 
+start_take_draws <- total_pop_post[, n_years_dynamic] # Dynamic terminal year indexing
 
 # ------------------------------------------------------------------------------
 # Generate baseline figure 1 layout graphics
 # ------------------------------------------------------------------------------
-# Extract summary statistics to recreate classic base layout visual distribution curves
 thedata <- abund_df %>% select(Year, Site, Annual_Nesters) %>% pivot_wider(names_from=Site, values_from=Annual_Nesters) %>% arrange(Year)
-raw_sums <- rowSums(thedata[, beach_cols], na.rm = TRUE); raw_sums[raw_sums == 0] <- NA; log_obs <- log(raw_sums)
+raw_sums <- rowSums(thedata[, beach_cols, drop = FALSE], na.rm = TRUE); raw_sums[raw_sums == 0] <- NA; log_obs <- log(raw_sums)
 
-X_total <- apply(cbind(trend_base$sims.list$X0, trend_base$sims.list$X), 2, function(v) rowSums(apply(trend_base$sims.list$A, 2, function(x) exp(v + x))))
-X0_total <- rowSums(apply(trend_base$sims.list$A, 2, function(x) exp(trend_base$sims.list$X0 + x)))
+# SAFE GUARD: Prevent dimension collapse for 'A' posteriors if n_ts == 1
+A_sims <- trend_base$sims.list$A
+if (is.null(dim(A_sims))) { A_sims <- matrix(A_sims, ncol = 1) }
+
+X_total <- apply(cbind(trend_base$sims.list$X0, trend_base$sims.list$X), 2, function(v) rowSums(apply(A_sims, 2, function(x) exp(v + x))))
+X0_total <- rowSums(apply(A_sims, 2, function(x) exp(trend_base$sims.list$X0 + x)))
 X_total_med <- apply(log(X_total), 2, median); X_q <- apply(log(X_total), 2, quantile, probs = c(0.025, 0.5, 0.975))
 
 yrange_vals <- c(log_obs, X_q); yrange <- range(yrange_vals[is.finite(yrange_vals)], na.rm = TRUE)
@@ -362,7 +374,15 @@ p_pva_traj <- ggplot(pva_summary, aes(x = Year, y = Median)) + geom_line(color =
 ggsave(paste0(out_dir, "/figure_2_pva_forward_abundance_trajectories.png"), p_pva_traj, width = 8, height = 5)
 
 # Calculate long-term population collapse crash probability indices across tracking profiles
+track_risk <- function(sim_matrix, initial_abundance_draws, threshold_fraction) {
+  crossed_threshold <- sapply(1:nrow(sim_matrix), function(i) {
+    any(sim_matrix[i, ] < (initial_abundance_draws[i] * threshold_fraction), na.rm = TRUE)
+  })
+  return(sum(crossed_threshold) / nrow(sim_matrix))
+}
+
 reg_thresh <- data.frame(Metric = paste(target_species, "Pooled Regional Cohort"), Risk_Below_50 = track_risk(sim_reg_matrix, n0_reg, 0.50), Risk_Below_25 = track_risk(sim_reg_matrix, n0_reg, 0.25), Risk_Below_12.5 = track_risk(sim_reg_matrix, n0_reg, 0.125))
+
 write.csv(reg_thresh, paste0(out_dir, "/table_3_threshold_collapse_risk.csv"), row.names = FALSE)
 
 # ==============================================================================
@@ -370,9 +390,10 @@ write.csv(reg_thresh, paste0(out_dir, "/table_3_threshold_collapse_risk.csv"), r
 # ==============================================================================
 message("--- Phase 4: Reconstructing historical take (2023 methods) ---")
 
-# Strict filtering of file tracking bounds to keep analysis isolated to the 2015 limits
-safe_df <- safe_df %>% filter(Year <= 2015)
-obs_df  <- obs_df %>% filter(Year <= 2015)
+# Dynamically scale file tracking filters to the terminal timeline boundary of your dataset
+max_dynamic_year <- max(years_vector)
+safe_df <- safe_df %>% filter(Year <= max_dynamic_year)
+obs_df  <- obs_df %>% filter(Year <= max_dynamic_year)
 
 # Standardize variable column text strings across dynamic custom entry formats
 if ("Point.Estimate" %in% names(safe_df)) { safe_df$Total_Est <- as.numeric(safe_df$Point.Estimate)
@@ -436,7 +457,7 @@ for (i in 1:nrow(all_sp_turtles)) {
   age_start <- sp_tknot - (1 / sp_k) * log(1 - (pmin(all_sp_turtles$Length[i], sp_linf - 0.1) / sp_linf))
   if(is.nan(age_start) || is.na(age_start)) age_start <- sp_max_age - 2 # Apply safety ceiling buffers
   
-  future_years <- seq(c_year, 2015) # Generate timeline windows from capture point up to baseline envelope edge
+  future_years <- seq(c_year, max_dynamic_year) # Dynamic lifecycle tracking ceiling
   l_y <- length(future_years); if(l_y < 1) next
   
   ages_traj <- seq(age_start, length.out = l_y, by = 1) # Advance individual ages linearly
@@ -457,21 +478,27 @@ for (i in 1:nrow(all_sp_turtles)) {
 site_props <- abund_df %>% group_by(Site) %>% summarise(mean_n = mean(Annual_Nesters, na.rm = TRUE), .groups = "drop") %>% mutate(prop = mean_n / sum(mean_n, na.rm = TRUE))
 final_historical_ane <- sp_ledger %>% group_by(CalendarYear) %>% summarise(Total_Cumulative_ANE = sum(ANE, na.rm=TRUE), .groups = "drop")
 
-# Reconstruct a counterfactual adjusted history matrix by adding lost reproductive counts back into dataset
+# Dynamically adjusts the counterfactual tracking matrix based on the user's objective configuration
 abund_adj <- abund_df %>%
   left_join(final_historical_ane, by = c("Year" = "CalendarYear")) %>%
   mutate(Total_Cumulative_ANE = ifelse(is.na(Total_Cumulative_ANE), 0, Total_Cumulative_ANE)) %>%
   left_join(site_props, by = "Site") %>%
-  mutate(Annual_Nesters = Annual_Nesters + (Total_Cumulative_ANE * prop)) %>% # Add lost turtles back to background tracks
+  mutate(Annual_Nesters = if(model_mode == "take") {
+    Annual_Nesters + (Total_Cumulative_ANE * prop) # Adds back fishery mortality losses
+  } else {
+    Annual_Nesters - (Total_Cumulative_ANE * prop) # Subtracts historical conservation gains
+  }) %>% 
   select(-Total_Cumulative_ANE, -prop, -mean_n)
 
 message("--- Running trend engine on fishery adjusted data ---")
 trend_adj <- run_trend_model(abund_adj, beach_cols) # Re-fit state-space model to counterfactual matrix
 
-# Extract counterfactual adult population size draws matching terminal baseline year (2015)
+# Extract counterfactual adult population size draws matching terminal baseline year
 X_post_adj <- trend_adj$sims.list$X; total_pop_post_adj <- exp(X_post_adj)
-for(j in 2:length(beach_cols)) { total_pop_post_adj <- total_pop_post_adj + exp(X_post_adj + trend_adj$sims.list$A[, j]) }
-total_pop_post_adj <- total_pop_post_adj * sp_remig_int; start_notake_draws <- total_pop_post_adj[, 31]
+if (length(beach_cols) > 1) {
+  for(j in 2:length(beach_cols)) { total_pop_post_adj <- total_pop_post_adj + exp(X_post_adj + trend_adj$sims.list$A[, j]) }
+}
+total_pop_post_adj <- total_pop_post_adj * sp_remig_int; start_notake_draws <- total_pop_post_adj[, n_years_dynamic]
 
 # Re-sample model posterior vectors to configure dual comparative projection tracks
 r_notake <- sample(trend_adj$sims.list$U, n_sims, replace = TRUE)
@@ -518,8 +545,13 @@ for(i in 1:n_sims) {
         take_ane_vector[y:horizon] <- take_ane_vector[y:horizon] + sr
       }
     }
-    # Subtract realized dynamic loss profiles from baseline trend trajectories
-    curr_t <- rnorm(1, (curr_t - take_ane_vector[y]) * exp(r_take[i]), sqrt(q_take[i])); sim_take[i,y] <- curr_t
+    # Adds additions or subtracts losses dynamically based on selected operational mode
+    if (model_mode == "take") {
+      curr_t <- rnorm(1, (curr_t - take_ane_vector[y]) * exp(r_take[i]), sqrt(q_take[i]))
+    } else {
+      curr_t <- rnorm(1, (curr_t + take_ane_vector[y]) * exp(r_take[i]), sqrt(q_take[i]))
+    }
+    sim_take[i,y] <- curr_t
   }
   # Extinction checks ensuring tracking channels drop cleanly to zero rather than negative numeric space
   if(any(sim_notake[i,] < 0)) { extinction_yr <- min(which(sim_notake[i,] < 0)); sim_notake[i, extinction_yr:horizon] <- 0 }
@@ -528,32 +560,99 @@ for(i in 1:n_sims) {
 }
 close(pb_dual)
 
-# Save final graphic figures and structural logs into relative output subdirectory
+# --- SUMMARY STATISTICS EXTRACTION PROXIES ---
+# Defined internally to prevent downstream environment missing-function errors
+calc_summary <- function(mat) {
+  data.frame(
+    Year = (max(abund_df$Year) + 1):(max(abund_df$Year) + horizon), 
+    Median = apply(mat, 2, median), 
+    L95 = apply(mat, 2, function(x) quantile(x, 0.025)), 
+    U95 = apply(mat, 2, function(x) quantile(x, 0.975))
+  )
+}
+
+# Automatically reformats narrative text and calculation signs based on model_mode orientation
 yrs_proj <- (max(abund_df$Year) + 1):(max(abund_df$Year) + horizon)
-df_notake <- calc_summary(sim_notake) %>% mutate(Scenario = "No Take (Nj + F)")
-df_take   <- calc_summary(sim_take) %>% mutate(Scenario = "Take (Nj)")
-df_diff   <- calc_summary(sim_notake - sim_take)
 
-p_overlay <- ggplot(bind_rows(df_notake, df_take), aes(x = Year, y = Median, color = Scenario, fill = Scenario)) + geom_line(linewidth = 1.2) + geom_ribbon(aes(ymin = L95, ymax = U95), alpha = 0.15, color = NA) + scale_color_manual(values = c("No Take (Nj + F)" = "chartreuse4", "Take (Nj)" = "dodgerblue4")) + scale_fill_manual(values = c("No Take (Nj + F)" = "chartreuse3", "Take (Nj)" = "dodgerblue3")) + theme_bw() + labs(title = paste("2023 methods validation: PVA projection overlay (", target_species, ")", sep=""), y = "Total Population")
-ggsave(paste0(out_dir, "/figure_3_take_vs_notake_baseline.png"), p_overlay, width = 8, height = 5)
+if (model_mode == "take") {
+  df_notake <- calc_summary(sim_notake) %>% mutate(Scenario = "Pristine Baseline (No Take)")
+  df_take   <- calc_summary(sim_take) %>% mutate(Scenario = "Status Quo (With Take)")
+  df_diff   <- calc_summary(sim_notake - sim_take) # Loss displays positively as penalty scale
+  title_overlay <- "PVA Projection Overlay: Fishery Take Impacts"
+  title_diff    <- "Isolated Cumulative Population Loss (Penalty Profile)"
+  col_palette   <- c("Pristine Baseline (No Take)" = "chartreuse4", "Status Quo (With Take)" = "dodgerblue4")
+  fill_palette  <- c("Pristine Baseline (No Take)" = "chartreuse3", "Status Quo (With Take)" = "dodgerblue3")
+} else {
+  df_notake <- calc_summary(sim_notake) %>% mutate(Scenario = "Unmanaged Baseline (No Benefit)")
+  df_take   <- calc_summary(sim_take) %>% mutate(Scenario = "Managed Scenario (With Benefit)")
+  df_diff   <- calc_summary(sim_take - sim_notake) # Benefits display positively as net gain scale
+  title_overlay <- "PVA Projection Overlay: Conservation Benefit Impacts"
+  title_diff    <- "Isolated Cumulative Population Benefit (Net Gain Profile)"
+  col_palette   <- c("Managed Scenario (With Benefit)" = "chartreuse4", "Unmanaged Baseline (No Benefit)" = "dodgerblue4")
+  fill_palette  <- c("Managed Scenario (With Benefit)" = "chartreuse3", "Unmanaged Baseline (No Benefit)" = "dodgerblue3")
+}
 
-p_diff <- ggplot(df_diff, aes(x = Year, y = Median)) + geom_line(color = "darkorchid4", linewidth = 1.2) + geom_ribbon(aes(ymin = L95, ymax = U95), fill = "darkorchid", alpha = 0.25) + theme_bw() + labs(title = paste("Isolated deep-set fleet cumulative penalty profile (", target_species, ")", sep=""), y = "\u0394 Total Population")
-ggsave(paste0(out_dir, "/figure_4_isolated_fishery_impact_difference.png"), p_diff, width = 8, height = 4)
+p_overlay <- ggplot(bind_rows(df_notake, df_take), aes(x = Year, y = Median, color = Scenario, fill = Scenario)) + 
+  geom_line(linewidth = 1.2) + 
+  geom_ribbon(aes(ymin = L95, ymax = U95), alpha = 0.15, color = NA) + 
+  scale_color_manual(values = col_palette) + 
+  scale_fill_manual(values = fill_palette) + 
+  theme_bw() + 
+  labs(title = paste0(title_overlay, " (", toupper(target_species), ")"), y = "Total Population Size")
+ggsave(paste0(out_dir, "/figure_3_pva_scenario_overlay.png"), p_overlay, width = 8, height = 5)
+
+p_diff <- ggplot(df_diff, aes(x = Year, y = Median)) + 
+  geom_line(color = "darkorchid4", linewidth = 1.2) + 
+  geom_ribbon(aes(ymin = L95, ymax = U95), fill = "darkorchid", alpha = 0.25) + 
+  theme_bw() + 
+  labs(title = paste0(title_diff, " (", toupper(target_species), ")"), y = "\u0394 Total Population Change")
+ggsave(paste0(out_dir, "/figure_4_isolated_demographic_difference.png"), p_diff, width = 8, height = 4)
 
 write.csv(data.frame(Baseline = c("True State (Nj)", "Fishery-Adjusted (Nj + F)"), Trend_r = c(mean(trend_base$sims.list$U), mean(trend_adj$sims.list$U)), Process_Variance_Q = c(mean(trend_base$sims.list$Q), mean(trend_adj$sims.list$Q))), paste0(out_dir, "/table_4_fishery_ledger.csv"), row.names = FALSE)
 
 # ==============================================================================
 # Automated text generation console display execution
 # ==============================================================================
-cat("\n==============================================================================\n")
-cat("               Loggerhead extraction engine: Output for 1985-2015 data        \n")
-cat("==============================================================================\n\n")
+# 1. Isolate the mathematical metrics up-front to keep layout formatting clean
+pct_change_base <- (exp(mean(trend_base$sims.list$U)) - 1) * 100
+pct_cri_base    <- (exp(quantile(trend_base$sims.list$U, probs = c(0.025, 0.975))) - 1) * 100
 
-pct_change_base <- (exp(mean(trend_base$sims.list$U)) - 1) * 100; pct_cri_base <- (exp(quantile(trend_base$sims.list$U, probs = c(0.025, 0.975))) - 1) * 100
-diff_matrix_cc <- sim_notake - sim_take
+# 2. Assign dynamic label structures and target matrices based on mode switches
+if (model_mode == "take") {
+  diff_matrix  <- sim_notake - sim_take
+  impact_label <- "Deficit (Fishery Take Loss)"
+} else {
+  diff_matrix  <- sim_take - sim_notake
+  impact_label <- "Net Gain (Conservation Benefit)"
+}
 
-cat("### Draft text generation ###\n\n")
-cat(sprintf("In the updated analysis, the estimated long-term trend for North Pacific loggerheads was %.2f%% (95%% CrI: %.2f%% to %.2f%%).\n", pct_change_base, pct_cri_base[1], pct_cri_base[2]))
-cat(sprintf("Current annual nester abundance was estimated at %.1f adults in the active cohort (95%% CrI: %.1f to %.1f).\n\n", median(start_take_draws), quantile(start_take_draws, 0.025), quantile(start_take_draws, 0.975)))
-cat(sprintf("Differences between take and no-take scenarios were %.2f adult female equivalents (95%% CrI: %.2f to %.2f) over the short-term projection period (10 years) and %.2f (95%% CrI: %.2f to %.2f) over the 100-year projection period.\n", median(diff_matrix_cc[, 10]), quantile(diff_matrix_cc[, 10], 0.025), quantile(diff_matrix_cc[, 10], 0.975), median(diff_matrix_cc[, 100]), quantile(diff_matrix_cc[, 100], 0.025), quantile(diff_matrix_cc[, 100], 0.975)))
-cat("==============================================================================\n")
+# 3. Assemble report via a single template structure to prevent console noise
+report_view <- sprintf("
+==============================================================================
+          PIFSC INTEGRATED PVA SCORECARD ENGINE: %s MATRIX OUTPUT
+==============================================================================
+
+[Baseline Trend Evaluation]
+* Long-Term Growth Rate (U): %+.2f%% / yr (95%% CrI: %+.2f%% to %+.2f%%)
+
+[Current Abundance Assessment]
+* Terminal Active Female Cohort: %.1f adults (95%% CrI: %.1f to %.1f)
+
+[Forward Projection Horizon Insights (100-Year Window)]
+* Cumulative Performance Impact Context: %s
+  - At Projection Year 10:  %.2f adult equivalents (95%% CrI: %.2f to %.2f)
+  - At Projection Year 100: %.2f adult equivalents (95%% CrI: %.2f to %.2f)
+
+==============================================================================
+", 
+                       toupper(target_species),
+                       pct_change_base, pct_cri_base[1], pct_cri_base[2],
+                       median(start_take_draws), quantile(start_take_draws, 0.025), quantile(start_take_draws, 0.975),
+                       impact_label,
+                       median(diff_matrix[, 10]), quantile(diff_matrix[, 10], 0.025), quantile(diff_matrix[, 10], 0.975),
+                       median(diff_matrix[, 100]), quantile(diff_matrix[, 100], 0.025), quantile(diff_matrix[, 100], 0.975)
+)
+
+# 4. Print the consolidated clean layout report out to the environment canvas
+cat(report_view)
+
